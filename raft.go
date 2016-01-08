@@ -183,6 +183,8 @@ func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps Sna
 		return nil, fmt.Errorf("failed to find last log: %v", err)
 	}
 
+	fmt.Println("last log index:", lastIdx)
+
 	// Get the log
 	var lastLog Log
 	if lastIdx > 0 {
@@ -1812,6 +1814,8 @@ func (r *Raft) restoreSnapshot() error {
 		r.setLastSnapshotIndex(snapshot.Index)
 		r.setLastSnapshotTerm(snapshot.Term)
 
+		r.logger.Printf("[INFO] last snapshot index %v", snapshot.Index)
+
 		// Success!
 		return nil
 	}
@@ -1821,4 +1825,13 @@ func (r *Raft) restoreSnapshot() error {
 		return fmt.Errorf("failed to load any existing snapshots")
 	}
 	return nil
+}
+
+func (r *Raft) GetLog(index uint64) (Log, error) {
+	var log Log
+	if err := r.logs.GetLog(index, &log); err != nil {
+		return log, err
+	}
+
+	return log, nil
 }
