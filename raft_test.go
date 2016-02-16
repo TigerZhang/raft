@@ -206,6 +206,15 @@ func (c *cluster) Disconnect(a string) {
 	}
 }
 
+func (c *cluster) IndexOf(r *Raft) int {
+	for i, n := range c.rafts {
+		if n == r {
+			return i
+		}
+	}
+	return -1
+}
+
 func (c *cluster) EnsureLeader(t *testing.T, expect string) {
 	limit := time.Now().Add(400 * time.Millisecond)
 CHECK:
@@ -251,7 +260,7 @@ CHECK:
 		if len(first.logs) != len(fsm.logs) {
 			fsm.Unlock()
 			if time.Now().After(limit) {
-				t.Fatalf("length mismatch: %d %d",
+				t.Fatalf("FSM log length mismatch: %d %d",
 					len(first.logs), len(fsm.logs))
 			} else {
 				goto WAIT
@@ -905,7 +914,22 @@ func TestRaft_RemoveLeader_NoShutdown(t *testing.T) {
 	leader := c.Leader()
 
 	// Remove the leader
-	leader.RemovePeer(leader.localAddr)
+	var removeFuture Future
+	for i := byte(0); i < 100; i++ {
+		future := leader.Apply([]byte{i}, 0)
+		if i == 80 {
+			removeFuture = leader.RemovePeer(leader.localAddr)
+		}
+		if i > 80 {
+			if err := future.Error(); err == nil || err != ErrNotLeader {
+				t.Fatalf("err: %v, future entries should fail", err)
+			}
+		}
+	}
+
+	if err := removeFuture.Error(); err != nil {
+		t.Fatalf("RemovePeer failed with error %v", err)
+	}
 
 	// Wait a while
 	time.Sleep(20 * time.Millisecond)
@@ -930,6 +954,9 @@ func TestRaft_RemoveLeader_NoShutdown(t *testing.T) {
 	if peers, _ := leader.peerStore.Peers(); len(peers) != 1 {
 		t.Fatalf("leader should have no peers")
 	}
+
+	// Other nodes should have the same state
+	c.EnsureSame(t)
 }
 
 func TestRaft_RemoveLeader_SplitCluster(t *testing.T) {
@@ -1339,6 +1366,11 @@ func TestRaft_LeaderLeaseExpire(t *testing.T) {
 		t.Fatalf("timeout stepping down as leader")
 	}
 
+	// Ensure the last contact of the leader is non-zero
+	if leader.LastContact().IsZero() {
+		t.Fatalf("expected non-zero contact time")
+	}
+
 	// Should be no leaders
 	if len(c.GetInState(Leader)) != 0 {
 		t.Fatalf("expected step down")
@@ -1571,7 +1603,7 @@ func TestRaft_NotifyCh(t *testing.T) {
 		if !v {
 			t.Fatalf("should become leader")
 		}
-	case <-time.After(conf.HeartbeatTimeout * 3):
+	case <-time.After(conf.HeartbeatTimeout * 6):
 		t.Fatalf("timeout becoming leader")
 	}
 
@@ -1584,7 +1616,38 @@ func TestRaft_NotifyCh(t *testing.T) {
 		if v {
 			t.Fatalf("should step down as leader")
 		}
-	case <-time.After(conf.HeartbeatTimeout * 3):
-		t.Fatalf("timeout becoming leader")
+	case <-time.After(conf.HeartbeatTimeout * 6):
+		t.Fatalf("timeout on step down as leader")
+	}
+}
+
+func TestRaft_Voting(t *testing.T) {
+	c := MakeCluster(3, t, nil)
+	defer c.Close()
+	followers := c.Followers()
+	ldr := c.Leader()
+	ldrT := c.trans[c.IndexOf(ldr)]
+
+	reqVote := RequestVoteRequest{
+		Term:         42,
+		Candidate:    ldrT.EncodePeer(ldr.localAddr),
+		LastLogIndex: ldr.LastIndex(),
+		LastLogTerm:  1,
+	}
+	// a follower that thinks there's a leader should vote for that leader.
+	var resp RequestVoteResponse
+	if err := ldrT.RequestVote(followers[0].localAddr, &reqVote, &resp); err != nil {
+		t.Fatalf("RequestVote RPC failed %v", err)
+	}
+	if !resp.Granted {
+		t.Fatalf("expected vote to be granted, but wasn't %+v", resp)
+	}
+	// a follow that thinks there's a leader shouldn't vote for a different candidate
+	reqVote.Candidate = ldrT.EncodePeer(followers[0].localAddr)
+	if err := ldrT.RequestVote(followers[1].localAddr, &reqVote, &resp); err != nil {
+		t.Fatalf("RequestVote RPC failed %v", err)
+	}
+	if resp.Granted {
+		t.Fatalf("expected vote not to be granted, but was %+v", resp)
 	}
 }
